@@ -8,7 +8,7 @@ pub mod parse;
 
 #[derive(Debug)]
 pub enum Pattern<L: Label> {
-    Single(Vec<PatternPart<L>>),
+    Single(PatternPart<L>),
     Choice(PatternChoice<L>),
     Concat(Vec<Self>),
 }

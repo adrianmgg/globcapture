@@ -58,8 +58,13 @@ impl<L: Label> ParseState<L> {
 
     fn finish_level(&mut self) {
         self.finish_literal_maybe();
-        self.levels
-            .push(Pattern::Single(std::mem::take(&mut self.cur_level)));
+        let mut parts = std::mem::take(&mut self.cur_level);
+        let part = if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            PatternPart::Concat(parts)
+        };
+        self.levels.push(Pattern::Single(part));
     }
 
     fn finish_level_maybe(&mut self) {
@@ -82,7 +87,11 @@ impl<L: Label> ParseState<L> {
     fn finish(mut self) -> Pattern<L> {
         if self.levels.is_empty() {
             self.finish_literal_maybe();
-            Pattern::Single(self.cur_level)
+            if self.cur_level.len() == 1 {
+                Pattern::Single(self.cur_level.pop().unwrap())
+            } else {
+                Pattern::Single(PatternPart::Concat(self.cur_level))
+            }
         } else {
             self.finish_level_maybe();
             Pattern::Concat(self.levels)
