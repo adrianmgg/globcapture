@@ -1,238 +1,324 @@
-use logos::Lexer;
+use std::sync::Arc;
+
+use byteyarn::Yarn;
+use miette::SourceSpan;
+use vec1::Vec1;
 
 use crate::{
-    Pattern, PatternPart,
+    engine,
     label::Label,
-    lex::{self, Token},
+    parse_util::resume_after_cut,
 };
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error<LabelErr> {
-    #[error(transparent)]
-    Lexer(lex::Error),
-    #[error(r#"failed converting {label:?} to a label"#)]
-    LabelConversion {
-        #[source]
-        source: LabelErr,
-        label: String,
+use winnow::{
+    LocatingSlice,
+    ascii::dec_uint,
+    combinator::{
+        alt, cut_err, dispatch, empty, fail, opt, peek, preceded, repeat, repeat_till, separated,
+        separated_pair, terminated,
     },
-    #[error(r#"choice separator ("|") encountered while not inside a choice"#)]
-    ChoiceSepOutsideChoice,
-    #[error(r#"character class has hyphen in the wrong place"#)]
-    CharClassThruMisplaced,
-    #[error("missing label on capture")]
-    CaptureMissingLabel,
-    #[error("multiple labels on capture")]
-    CaptureMultipleLabels,
+    error::{AddContext, ErrMode, FromRecoverableError, StrContext, StrContextValue},
+    prelude::*,
+    stream::{Location, Recoverable, Stream},
+    token::{any, take_while},
+};
+
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("failed to parse pattern")]
+pub struct Error {
+    #[source_code]
+    pub src: Arc<String>,
+    #[related]
+    pub problems: Vec<Problem>,
 }
 
-struct ParseState<L: Label> {
-    levels: Vec<Pattern<L>>,
-    cur_level: Vec<PatternPart<L>>,
-    cur_literal: String,
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{}", message.as_deref().unwrap_or("something went wrong"))]
+pub struct Problem {
+    #[source_code]
+    pub src: Arc<String>,
+
+    #[label("{}", label.as_deref().unwrap_or("here"))]
+    pub span: SourceSpan,
+
+    pub message: Option<String>,
+
+    pub label: Option<String>,
+
+    #[help]
+    pub help: Option<String>,
 }
 
-impl<L: Label> ParseState<L> {
-    fn new() -> Self {
+// type ErrorStr<'source> = Error<&'source str>;
+//
+// impl ErrorStr<'_> {
+//     pub fn to_owned(self) -> Error<String> {
+//         Error {
+//             src: self.src.to_owned(),
+//             problems: self.problems,
+//         }
+//     }
+// }
+
+#[derive(Debug, Default, Clone)]
+struct ParseError {
+    message: Option<String>,
+    span: Option<SourceSpan>,
+    label: Option<String>,
+    help: Option<String>,
+}
+
+impl<I: Stream> winnow::error::ParserError<I> for ParseError {
+    type Inner = Self;
+
+    fn from_input(_input: &I) -> Self {
         Self {
-            levels: Vec::new(),
-            cur_level: Vec::new(),
-            cur_literal: String::new(),
+            label: None,
+            message: None,
+            span: None,
+            help: None,
         }
     }
 
-    fn is_mid_level(&self) -> bool {
-        !(self.cur_level.is_empty() && self.cur_literal.is_empty())
+    fn into_inner(self) -> winnow::Result<Self::Inner, Self> {
+        Ok(self)
     }
+}
 
-    fn put_literal_char(&mut self, c: char) {
-        self.cur_literal.push(c);
+impl<I: Stream + winnow::stream::Location> FromRecoverableError<I, Self> for ParseError {
+    fn from_recoverable_error(
+        token_start: &<I as Stream>::Checkpoint,
+        _err_start: &<I as Stream>::Checkpoint,
+        input: &I,
+        mut e: Self,
+    ) -> Self {
+        e.span = e.span.or_else(|| {
+            Some(
+                ((input.current_token_start() - input.offset_from(token_start))
+                    ..input.current_token_start())
+                    .into(),
+            )
+        });
+        e
     }
+}
 
-    fn finish_literal_maybe(&mut self) {
-        if !self.cur_literal.is_empty() {
-            self.cur_level
-                .push(PatternPart::Literal(std::mem::take(&mut self.cur_literal)));
-        }
-    }
-
-    fn finish_level(&mut self) {
-        self.finish_literal_maybe();
-        let mut parts = std::mem::take(&mut self.cur_level);
-        let part = if parts.len() == 1 {
-            parts.pop().unwrap()
-        } else {
-            PatternPart::Concat(parts)
-        };
-        self.levels.push(Pattern::Single(part));
-    }
-
-    fn finish_level_maybe(&mut self) {
-        if self.is_mid_level() {
-            self.finish_level();
-        }
-        assert!(!self.is_mid_level());
-    }
-
-    fn put_level_part(&mut self, part: PatternPart<L>) {
-        self.finish_literal_maybe();
-        self.cur_level.push(part);
-    }
-
-    fn put_level(&mut self, level: Pattern<L>) {
-        self.finish_level_maybe();
-        self.levels.push(level);
-    }
-
-    fn finish(mut self) -> Pattern<L> {
-        if self.levels.is_empty() {
-            self.finish_literal_maybe();
-            if self.cur_level.len() == 1 {
-                Pattern::Single(self.cur_level.pop().unwrap())
-            } else {
-                Pattern::Single(PatternPart::Concat(self.cur_level))
-            }
-        } else {
-            self.finish_level_maybe();
-            Pattern::Concat(self.levels)
+impl<I: Stream + winnow::stream::Location> FromRecoverableError<I, ErrMode<Self>> for ParseError {
+    fn from_recoverable_error(
+        _token_start: &<I as Stream>::Checkpoint,
+        _err_start: &<I as Stream>::Checkpoint,
+        _input: &I,
+        e: ErrMode<Self>,
+    ) -> Self {
+        match e {
+            ErrMode::Incomplete(_) => Self::default(),
+            ErrMode::Backtrack(err) | ErrMode::Cut(err) => err,
         }
     }
 }
 
-pub(crate) fn parse<L: Label>(lex: &mut Lexer<'_, Token>) -> Result<Pattern<L>, Error<L::Error>> {
-    let mut state = ParseState::new();
-    for tok in lex.by_ref() {
-        match tok.map_err(Error::Lexer)? {
-            Token::ChoiceEnd => {
-                unreachable!("end token received by parser, but lexer should never emit that token")
-            }
-            Token::ChoiceSep => return Err(Error::ChoiceSepOutsideChoice),
-            Token::PathSep => {
-                state.finish_level();
-            }
-            Token::CharClass(char_cls_toks) => {
-                state.put_level_part(PatternPart::CharClass(parse_char_cls(char_cls_toks)?));
-            }
-            Token::Capture(capture_toks) => {
-                state.put_level_part(PatternPart::Capture(parse_capture(capture_toks)?));
-            }
-            Token::Choice(tokens) => {
-                let choice = parse_choice(tokens, state.is_mid_level())?;
-                match choice {
-                    ChoiceParseResult::IntraLevel(choice) => {
-                        state.put_level_part(PatternPart::Choice(choice))
-                    }
-                    ChoiceParseResult::InterLevel(choice) => {
-                        assert!(!state.is_mid_level());
-                        state.put_level(Pattern::Choice(choice));
-                    }
-                }
-            }
-            Token::LiteralChar(c) => {
-                state.put_literal_char(c);
-            }
-        }
+impl<I: Stream> AddContext<I, Context> for ParseError {
+    fn add_context(
+        mut self,
+        _input: &I,
+        _token_start: &<I as Stream>::Checkpoint,
+        ctx: Context,
+    ) -> Self {
+        self.message = ctx.message.or(self.message);
+        self.label = ctx.label.or(self.label);
+        self.help = ctx.help.or(self.help);
+        self
     }
-    Ok(state.finish())
 }
 
-fn parse_char_cls<LabelErr>(
-    tokens: Vec<lex::CharClsTok>,
-) -> Result<crate::PatternPartCharClass, Error<LabelErr>> {
-    let mut parts = Vec::new();
-    #[derive(Debug)]
-    enum State {
-        Nothing,
-        Start(char),
-        StartAndThru(char),
-    }
-    let mut state = State::Nothing;
-    for tok in tokens {
-        match tok {
-            lex::CharClsTok::End => {
-                unreachable!("end token received by parser, but lexer should never emit that token")
-            }
-            lex::CharClsTok::Thru => match state {
-                State::Nothing => return Err(Error::CharClassThruMisplaced),
-                State::Start(c) => state = State::StartAndThru(c),
-                State::StartAndThru(_) => return Err(Error::CharClassThruMisplaced),
-            },
-            lex::CharClsTok::Char(cur) => match state {
-                State::Nothing => state = State::Start(cur),
-                State::Start(prev_start) => {
-                    parts.push(prev_start..=prev_start);
-                    state = State::Start(cur);
-                }
-                State::StartAndThru(start) => {
-                    parts.push(start..=cur);
-                    state = State::Nothing;
-                }
-            },
-        }
-    }
-    match state {
-        State::Nothing => {}
-        State::Start(c) => parts.push(c..=c),
-        State::StartAndThru(_) => return Err(Error::CharClassThruMisplaced),
-    }
-    Ok(crate::PatternPartCharClass(parts))
+// based on kdl-rs's KdlParseContext
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+struct Context {
+    message: Option<String>,
+    label: Option<String>,
+    help: Option<String>,
 }
 
-fn parse_capture<L: Label>(
-    tokens: Vec<lex::CaptureTok>,
-) -> Result<crate::PatternPartCapture<L>, Error<L::Error>> {
-    let mut label = None;
-    let mut parts = Vec::new();
-    let mut cur_literal = String::new();
+impl Context {
+    fn msg(mut self, txt: impl AsRef<str>) -> Self {
+        self.message = Some(txt.as_ref().to_string());
+        self
+    }
 
-    for tok in tokens {
-        match tok {
-            lex::CaptureTok::End => {
-                unreachable!("end token received by parser, but lexer should never emit that token")
-            }
-            lex::CaptureTok::Label(label_str) => match label {
-                Some(_) => return Err(Error::CaptureMultipleLabels),
-                None => match L::parse_label(&label_str) {
-                    Err(err) => {
-                        return Err(Error::LabelConversion {
-                            source: err,
-                            label: label_str,
-                        });
-                    }
-                    Ok(l) => label = Some(l),
+    fn label(mut self, txt: impl AsRef<str>) -> Self {
+        self.label = Some(txt.as_ref().to_string());
+        self
+    }
+
+    fn help(mut self, txt: impl AsRef<str>) -> Self {
+        self.help = Some(txt.as_ref().to_string());
+        self
+    }
+}
+
+fn ctx() -> Context {
+    Default::default()
+}
+
+type PInput<'i> = Recoverable<LocatingSlice<&'i str>, ParseError>;
+
+type PResult<'source, O> = winnow::ModalResult<O, ParseError>;
+
+pub fn parse<'source>(source: &'source str) -> Result<(), Error> {
+    let input = LocatingSlice::new(source);
+    let (_, val, problems) = nq::<String>.recoverable_parse(input);
+    if let (Some(val), true) = (val, problems.is_empty()) {
+        dbg!(val);
+        Ok(())
+    } else {
+        let src = Arc::<String>::new(source.into());
+        Err(Error {
+            src: src.clone(),
+            problems: problems
+                .into_iter()
+                .map(|e| Problem {
+                    src: src.clone(),
+                    span: e.span.unwrap_or_else(|| (0usize..0usize).into()),
+                    message: e.message,
+                    label: e.label,
+                    help: e.help,
+                })
+                .collect(),
+        })
+    }
+}
+
+fn nq<'i, L: Label>(input: &mut PInput<'i>) -> PResult<'i, engine::NameQuery<L>> {
+    repeat(1.., nq_item)
+        .map(|parts| engine::NameQuery { parts })
+        .parse_next(input)
+}
+
+fn nq_item<'i, L: Label>(input: &mut PInput<'i>) -> PResult<'i, engine::NQItem<L>> {
+    (nq_no_repeat, opt(repeat_count))
+        .map(|(content, count)| match count {
+            None => engine::NQItem::Simple(content),
+            Some(count) => engine::NQItem::Repeat { content, count },
+        })
+        .parse_next(input)
+}
+
+fn nq_no_repeat<'i, L: Label>(input: &mut PInput<'i>) -> PResult<'i, engine::NQNoRepeat<L>> {
+    dispatch! {peek(any);
+        '(' => resume_after_cut(
+            preceded('(', cut_err(terminated(nq_group_inner, ')'))).map(engine::NQNoRepeat::Group),
+            // TODO should we make the resume recover skip "/)"s?
+            repeat_till(1.., alt((('\\', any).void(), any.void())), ')').map(|((), _)| ()),
+        )
+        .verify_map(|g|
+            g.or_else(|| Some(engine::NQNoRepeat::Group(engine::NQGroup {
+                choices: Vec1::new(engine::NameQuery { parts: Vec::new() }),
+                label: None,
+            })))
+        ),
+        // '(' => preceded('(', cut_err(terminated(nq_group_inner, ')'))).map(engine::NQNoRepeat::Group),
+        '[' => preceded('[', cut_err(terminated(nq_charclass_inner, ']'))).map(engine::NQNoRepeat::CharClass),
+        '\\' => preceded('\\', any).map(|c| engine::NQNoRepeat::Literal(engine::NQLiteral { value: Yarn::from_char(c) })),
+        ')' | ']' | '{' | '}' | '|' => fail,
+        _ => any.map(|c| engine::NQNoRepeat::Literal(engine::NQLiteral { value: Yarn::from_char(c) })),
+    }
+    .parse_next(input)
+}
+
+fn label<'i, L: Label>(input: &mut PInput<'i>) -> PResult<'i, L> {
+    preceded('<', cut_err(terminated(label_content, '>'))).parse_next(input)
+}
+
+fn label_content<'i, L: Label>(input: &mut PInput<'i>) -> PResult<'i, L> {
+    let start = input.checkpoint();
+    let text: String = repeat(
+        0..,
+        dispatch! {peek(any);
+            '\\' => preceded('\\', any),
+            '>' => fail,
+            _ => any,
+        },
+    )
+    .parse_next(input)?;
+    // TODO wait do i need to rewind to the start or is that the caller's responsibility
+    match L::parse_label(&text) {
+        Ok(label) => Ok(label),
+        // (just gonna piggyback off of from_recoverable_error since that already handles calculating the span)
+        Err(err) => Err(FromRecoverableError::from_recoverable_error(
+            &start,
+            &start,
+            input,
+            ErrMode::Cut(ParseError {
+                message: Some(format!("{}", err)),
+                span: None,
+                label: None,
+                help: None,
+            }),
+        )),
+    }
+}
+
+fn nq_group_inner<'i, L: Label>(input: &mut PInput<'i>) -> PResult<'i, engine::NQGroup<L>> {
+    (opt(label), separated(1.., nq, '|'))
+        .map(|(label, choices)| engine::NQGroup {
+            label,
+            choices: Vec1::try_from_vec(choices).unwrap_or_else(|_| unreachable!()),
+        })
+        .parse_next(input)
+}
+
+fn nq_charclass_inner<'i>(input: &mut PInput<'i>) -> PResult<'i, engine::NQCharClass> {
+    (
+        opt('^'.value(true)).map(|o| o.unwrap_or_else(|| false)),
+        repeat(0.., charclass_item),
+    )
+        .map(|(inverted, choices)| engine::NQCharClass { inverted, choices })
+        .parse_next(input)
+}
+
+fn charclass_item_char<'i>(input: &mut PInput<'i>) -> PResult<'i, char> {
+    // alt((preceded('\\', any), any))
+    dispatch! {peek(any);
+        '\\' => preceded('\\', any),
+        '^' | '-' | '[' | ']' => fail
+            .context(ctx().msg("special characters inside character class must be backslash-escaped")),
+        _ => any,
+    }
+    .parse_next(input)
+}
+
+fn charclass_item<'i>(input: &mut PInput<'i>) -> PResult<'i, engine::CharClassItem> {
+    alt((
+        (
+            charclass_item_char,
+            preceded('-', cut_err(charclass_item_char)),
+        )
+            .map(|(a, b)| engine::CharClassItem(a..=b)),
+        charclass_item_char.map(|c| engine::CharClassItem(c..=c)),
+    ))
+    .parse_next(input)
+}
+
+fn repeat_count<'i>(input: &mut PInput<'i>) -> PResult<'i, engine::RepeatCount> {
+    preceded(
+        '{',
+        resume_after_cut(
+            cut_err(terminated(
+                dispatch! {peek(any);
+                    '*' => '*'.value((0, None)),
+                    '+' => '+'.value((1, None)),
+                    '?' => '?'.value((0, Some(1))),
+                    '0'..='9' => separated_pair(dec_uint, ",", opt(dec_uint)),
+                    ',' => preceded(',', dec_uint).map(|hi| (0, Some(hi))),
+                    _ => fail
+                        .context(ctx().msg("expected '*', '+', '?', or explicit min,max")),
                 },
-            },
-            lex::CaptureTok::CharClass(char_cls_toks) => {
-                if !cur_literal.is_empty() {
-                    parts.push(PatternPart::Literal(std::mem::take(&mut cur_literal)));
-                }
-                parts.push(PatternPart::CharClass(parse_char_cls(char_cls_toks)?));
-            }
-            lex::CaptureTok::Char(c) => cur_literal.push(c),
-        }
-    }
-    if !cur_literal.is_empty() {
-        parts.push(PatternPart::Literal(std::mem::take(&mut cur_literal)));
-    }
-
-    let label = match label {
-        Some(label) => label,
-        None => return Err(Error::CaptureMissingLabel),
-    };
-    Ok(crate::PatternPartCapture {
-        item: Box::new(PatternPart::Concat(parts)),
-        label,
-    })
-}
-
-enum ChoiceParseResult<L: Label> {
-    InterLevel(crate::PatternChoice<L>),
-    IntraLevel(crate::PatternPartChoice<L>),
-}
-
-fn parse_choice<L: Label>(
-    tokens: Vec<Token>,
-    starting_mid_level: bool,
-) -> Result<ChoiceParseResult<L>, Error<L::Error>> {
-    todo!()
+                "}",
+            )),
+            repeat_till(1.., alt((('\\', any).void(), any.void())), '}').map(|((), _)| ()),
+        ),
+    )
+    .map(|o| o.unwrap_or((0, Some(0))))
+    .map(|(lo, hi)| engine::RepeatCount { lo, hi })
+    .parse_next(input)
 }

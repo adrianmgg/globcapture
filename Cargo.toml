@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-logos = ">= 0.14"
+byteyarn = "0.5.1"
+miette = "7.6.0"
 thiserror = "2"
+vec1 = "1.12.1"
+winnow = { version = "0.7.7", features = ["unstable-recover"] }

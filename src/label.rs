@@ -1,7 +1,10 @@
-use std::{convert::Infallible, fmt::Debug};
+use std::{
+    convert::Infallible,
+    fmt::{Debug, Display},
+};
 
 pub trait Label: PartialEq + Debug + Clone {
-    type Error;
+    type Error: Display;
     fn parse_label(text: &'_ str) -> Result<Self, Self::Error>;
 }
 
