@@ -70,7 +70,10 @@ this one's a rewrite of winnow's resume_after in which the recover has the same 
 
 */
 
-pub(crate) fn resume_after_nooption<P, R, I, O, E>(mut parser: P, mut recover: R) -> impl Parser<I, O, E>
+pub(crate) fn resume_after_nooption<P, R, I, O, E>(
+    mut parser: P,
+    mut recover: R,
+) -> impl Parser<I, O, E>
 where
     P: Parser<I, O, E>,
     R: Parser<I, O, E>,

@@ -64,7 +64,7 @@ impl winnow::stream::Location for crate::lex::Token<'_> {
     fn previous_token_end(&self) -> usize {
         self.span.start
     }
-    
+
     fn current_token_start(&self) -> usize {
         self.span.start - 1
     }
@@ -158,5 +158,11 @@ fn token<'i>(input: &mut LInput<'i>) -> LResult<Token<'i>> {
 pub(crate) fn lex(input: LocatingSlice<&str>) -> (Option<Vec<Token<'_>>>, Vec<ParseError>) {
     let (_input, val, problems): (_, Option<Vec<_>>, Vec<_>) =
         terminated(repeat(0.., token), cut_err(eof)).recoverable_parse(input);
+    let val = val.map(|tokens| {
+        tokens
+            .into_iter()
+            .filter(|t| t.kind != TokenKind::Unexpected)
+            .collect()
+    });
     (val, problems)
 }

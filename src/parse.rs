@@ -372,7 +372,7 @@ fn repeat_count<'i>(input: &mut PInput<'i>) -> PResult<'i, engine::RepeatCount> 
 fn plain_char_or_escaped<'i>(input: &mut PInput<'i>) -> PResult<'i, char> {
     alt((
         TokenKind::PlainCharacter.map(|t| t.raw.chars().nth(0).unwrap()),
-        TokenKind::EscapedPlainCharacter.map(|t| t.raw.chars().nth(1).unwrap()),
+        TokenKind::EscapedPlainCharacter.map(|t| t.raw.chars().nth(0).unwrap()),
     ))
     .parse_next(input)
 }
