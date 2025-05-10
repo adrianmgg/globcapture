@@ -63,3 +63,56 @@ where
     // TODO is wrapping this in Cut(...) the way we should be handling this?
     Err(ErrMode::Cut(err))
 }
+
+/*
+
+this one's a rewrite of winnow's resume_after in which the recover has the same result type as the main parser, rather than returning an option
+
+*/
+
+pub(crate) fn resume_after_nooption<P, R, I, O, E>(mut parser: P, mut recover: R) -> impl Parser<I, O, E>
+where
+    P: Parser<I, O, E>,
+    R: Parser<I, O, E>,
+    I: Stream,
+    I: Recover<E>,
+    E: ParserError<I> + FromRecoverableError<I, E>,
+{
+    trace("resume_after_nooption", move |input: &mut I| {
+        resume_after_nooption_inner(&mut parser, &mut recover, input)
+    })
+}
+
+fn resume_after_nooption_inner<P, R, I, O, E>(
+    parser: &mut P,
+    recover: &mut R,
+    i: &mut I,
+) -> Result<O, E>
+where
+    P: Parser<I, O, E>,
+    R: Parser<I, O, E>,
+    I: Stream,
+    I: Recover<E>,
+    E: ParserError<I> + FromRecoverableError<I, E>,
+{
+    let token_start = i.checkpoint();
+    let mut err = match parser.parse_next(i) {
+        Ok(o) => {
+            return Ok(o);
+        }
+        Err(e) if e.is_incomplete() => return Err(e),
+        Err(err) => err,
+    };
+    let err_start = i.checkpoint();
+    if let Ok(recov) = recover.parse_next(i) {
+        if let Err(err_) = i.record_err(&token_start, &err_start, err) {
+            err = err_;
+        } else {
+            return Ok(recov);
+        }
+    }
+
+    i.reset(&err_start);
+    err = FromRecoverableError::from_recoverable_error(&token_start, &err_start, i, err);
+    Err(err)
+}

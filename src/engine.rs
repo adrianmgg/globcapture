@@ -21,28 +21,22 @@ pub struct Pattern<L: Label> {
 // #########
 
 #[derive(Debug)]
-struct LayerSingle<L: Label> {
-    query: NameQuery<L>,
-    attr_filter: Option<Vec1<AttrFilter>>,
+pub(crate) struct LayerSingle<L: Label> {
+    pub(crate) query: NameQuery<L>,
+    pub(crate) attr_filter: Option<Vec1<AttrFilter>>,
 }
 
 #[derive(Debug)]
-struct LayerGroup<L: Label> {
-    choices: Vec1<Layer<L>>,
+pub(crate) struct LayerGroup<L: Label> {
+    pub(crate) choices: Vec1<Layer<L>>,
 }
 
 #[derive(Debug)]
-enum LayerNoRepeat<L: Label> {
+pub(crate) enum Layer<L: Label> {
     Single(LayerSingle<L>),
-    Group(LayerGroup<L>),
-}
-
-#[derive(Debug)]
-enum Layer<L: Label> {
-    Simple(LayerNoRepeat<L>),
-    Repeat {
-        content: LayerNoRepeat<L>,
-        count: RepeatCount,
+    Group {
+        content: LayerGroup<L>,
+        repeat_count: Option<RepeatCount>,
     },
 }
 
